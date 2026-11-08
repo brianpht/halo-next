@@ -123,6 +123,51 @@ tasks.withType<Checkstyle>().matching { it.name.contains("Jmh") || it.name.conta
     enabled = false
 }
 
+// Fails if a hot-path benchmark breaches its absolute latency budget (ADR 0003).
+// Gates on the documented budget, not raw deltas, so a noisy quickBench run does
+// not produce flaky failures. Only benchmarks present in the results are checked.
+tasks.register("jmhBudgetCheck") {
+    description = "Verifies hot-path JMH benchmarks stay within the ADR 0003 latency budget."
+    group = "verification"
+    dependsOn("jmh")
+    val resultsFile = layout.buildDirectory.file("results/jmh/results.json")
+    doLast {
+        val budgetsNs = mapOf(
+            "decodeHeader" to 100.0,
+            "lookupHit" to 200.0,
+            "get" to 10_000.0,
+            "put" to 5_000.0,
+        )
+        val file = resultsFile.get().asFile
+        if (!file.exists()) {
+            throw GradleException("JMH results not found at ${file.path}; run the jmh task first.")
+        }
+        @Suppress("UNCHECKED_CAST")
+        val results = groovy.json.JsonSlurper().parse(file) as List<Map<String, Any>>
+        val breaches = mutableListOf<String>()
+        results.forEach { entry ->
+            val name = (entry["benchmark"] as String).substringAfterLast('.')
+            val budget = budgetsNs[name] ?: return@forEach
+            val metric = entry["primaryMetric"] as Map<String, Any>
+            val unit = metric["scoreUnit"] as String
+            val factor = when {
+                unit.startsWith("ns") -> 1.0
+                unit.startsWith("us") -> 1_000.0
+                unit.startsWith("ms") -> 1_000_000.0
+                else -> 1.0
+            }
+            val scoreNs = (metric["score"] as Number).toDouble() * factor
+            if (scoreNs > budget) {
+                breaches += "$name: ${"%.1f".format(scoreNs)} ns > budget ${budget} ns"
+            }
+        }
+        if (breaches.isNotEmpty()) {
+            throw GradleException("Hot-path latency budget exceeded (ADR 0003):\n  " + breaches.joinToString("\n  "))
+        }
+        logger.lifecycle("JMH budget check passed.")
+    }
+}
+
 tasks.withType<Javadoc>().configureEach {
     options.encoding = "UTF-8"
     (options as StandardJavadocDocletOptions).addStringOption("Xdoclint:none", "-quiet")
