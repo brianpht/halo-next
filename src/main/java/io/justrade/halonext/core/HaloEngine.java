@@ -19,11 +19,16 @@ import io.justrade.halonext.file.TombstoneFile;
 import io.justrade.halonext.index.OffHeapIndex;
 import io.justrade.halonext.index.RecordLocation;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Comparator;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Stream;
 import org.agrona.CloseHelper;
 import org.agrona.ErrorHandler;
 import org.agrona.MutableDirectBuffer;
@@ -35,6 +40,8 @@ import org.agrona.concurrent.MessageHandler;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.ringbuffer.ManyToOneRingBuffer;
 import org.agrona.concurrent.ringbuffer.RingBufferDescriptor;
+import org.agrona.concurrent.status.AtomicCounter;
+import org.agrona.concurrent.status.CountersReader;
 
 /**
  * Single-writer, multi-reader storage engine. Writes are serialized by one lock
@@ -67,9 +74,17 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
     private final IntHashSet queuedFiles = new IntHashSet();
     private final MessageHandler pollHandler = this::onPolledFileId;
 
+    private final UnsafeBuffer countersBuffer =
+            new UnsafeBuffer(ByteBuffer.allocateDirect(4 * CountersReader.COUNTER_LENGTH));
+    private final AtomicCounter putCounter = new AtomicCounter(countersBuffer, 0);
+    private final AtomicCounter getCounter = new AtomicCounter(countersBuffer, 1);
+    private final AtomicCounter deleteCounter = new AtomicCounter(countersBuffer, 2);
+
     private volatile DataFile[] readFiles;
     private volatile boolean compacting;
+    private volatile boolean compactionPaused;
     private int polledFileId = -1;
+    private long totalStaleBytes;
 
     private DataFile currentWriteFile;
     private IndexFile currentIndexFile;
@@ -116,6 +131,7 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
                 markStale(writerScratch.fileId(), HEADER + key.length + writerScratch.valueSize());
             }
             index.put(key, currentWriteFile.fileId(), valueOffset, value.length, sequenceNumber);
+            putCounter.increment();
             return true;
         } finally {
             writeLock.unlock();
@@ -123,6 +139,7 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
     }
 
     public byte[] get(final byte[] key) throws IOException {
+        getCounter.increment();
         final RecordLocation location = new RecordLocation();
         for (int attempt = 0; attempt < 5; attempt++) {
             if (!index.get(key, location)) {
@@ -158,6 +175,7 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
             currentTombstoneFile.write(key, sequenceNumber);
             markStale(writerScratch.fileId(), HEADER + key.length + writerScratch.valueSize());
             index.remove(key);
+            deleteCounter.increment();
             return true;
         } finally {
             writeLock.unlock();
@@ -170,6 +188,129 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
 
     public boolean isCompactionComplete() {
         return compactionQueue.size() == 0 && !compacting;
+    }
+
+    /** Stops the agent from starting new compactions and waits for any in-flight compaction to finish. */
+    public void pauseCompaction() {
+        compactionPaused = true;
+        while (compacting) {
+            Thread.onSpinWait();
+        }
+    }
+
+    public void resumeCompaction() {
+        compactionPaused = false;
+    }
+
+    public long numberOfPuts() {
+        return putCounter.get();
+    }
+
+    public long numberOfGets() {
+        return getCounter.get();
+    }
+
+    public long numberOfDeletes() {
+        return deleteCounter.get();
+    }
+
+    public void resetStats() {
+        putCounter.set(0);
+        getCounter.set(0);
+        deleteCounter.set(0);
+    }
+
+    public int numberOfDataFiles() {
+        int count = 0;
+        for (final DataFile file : readFiles) {
+            if (file != null) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    public int numberOfTombstoneFiles() throws IOException {
+        return directory.listTombstoneFileIds().length;
+    }
+
+    public long totalStaleBytes() {
+        writeLock.lock();
+        try {
+            return totalStaleBytes;
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /** Returns true if the index still maps {@code key} to exactly this file and version. */
+    public boolean isLiveVersion(final byte[] key, final int fileId, final long sequenceNumber) {
+        final RecordLocation location = new RecordLocation();
+        return index.get(key, location) && location.fileId() == fileId && location.sequenceNumber() == sequenceNumber;
+    }
+
+    /** Ids of all currently readable data files, for iteration. */
+    public int[] snapshotFileIds() {
+        final DataFile[] files = readFiles;
+        int count = 0;
+        for (final DataFile file : files) {
+            if (file != null) {
+                count++;
+            }
+        }
+        final int[] ids = new int[count];
+        int i = 0;
+        for (int id = 0; id < files.length; id++) {
+            if (files[id] != null) {
+                ids[i++] = id;
+            }
+        }
+        return ids;
+    }
+
+    public DataFile dataFileForRead(final int fileId) {
+        final DataFile[] files = readFiles;
+        return fileId < files.length ? files[fileId] : null;
+    }
+
+    public Path getSnapshotDirectory() {
+        return directory.path().resolve("snapshot");
+    }
+
+    /** Captures a consistent snapshot of the database files by hard-linking (or copying) them. */
+    public boolean snapshot() throws IOException {
+        pauseCompaction();
+        try {
+            writeLock.lock();
+            try {
+                currentWriteFile.flush();
+                currentIndexFile.flush();
+                if (currentTombstoneFile != null) {
+                    currentTombstoneFile.flush();
+                }
+            } finally {
+                writeLock.unlock();
+            }
+            final Path snapshotDir = getSnapshotDirectory();
+            deleteRecursively(snapshotDir);
+            Files.createDirectories(snapshotDir);
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory.path())) {
+                for (final Path entry : stream) {
+                    final String name = entry.getFileName().toString();
+                    if (Files.isRegularFile(entry) && isDatabaseFile(name)) {
+                        linkOrCopy(entry, snapshotDir.resolve(name));
+                    }
+                }
+            }
+            return true;
+        } finally {
+            resumeCompaction();
+        }
+    }
+
+    public boolean clearSnapshot() throws IOException {
+        deleteRecursively(getSnapshotDirectory());
+        return true;
     }
 
     @Override
@@ -203,6 +344,9 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
     @Override
     public int pollFileId() {
         polledFileId = -1;
+        if (compactionPaused) {
+            return -1;
+        }
         compactionQueue.read(pollHandler, 1);
         if (polledFileId >= 0) {
             writeLock.lock();
@@ -354,7 +498,8 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
         Files.deleteIfExists(directory.path().resolve(FileNames.indexFile(fileId)));
         writeLock.lock();
         try {
-            staleBytesPerFile.remove(fileId);
+            final int removed = staleBytesPerFile.remove(fileId);
+            totalStaleBytes -= removed;
         } finally {
             writeLock.unlock();
         }
@@ -441,6 +586,7 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
 
     private void markStale(final int fileId, final int bytes) {
         staleBytesPerFile.put(fileId, staleBytesPerFile.get(fileId) + bytes);
+        totalStaleBytes += bytes;
         maybeEnqueueForCompaction(fileId);
     }
 
@@ -484,6 +630,36 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
     private static void requireValidKey(final byte[] key) {
         if (key.length < 1 || key.length > 255) {
             throw new IllegalArgumentException("Key size must be in [1, 255], was " + key.length);
+        }
+    }
+
+    private static boolean isDatabaseFile(final String name) {
+        return name.endsWith(FileNames.DATA_EXTENSION)
+                || name.endsWith(FileNames.INDEX_EXTENSION)
+                || name.endsWith(FileNames.TOMBSTONE_EXTENSION)
+                || name.equals(FileNames.META_FILE);
+    }
+
+    private static void linkOrCopy(final Path source, final Path target) throws IOException {
+        try {
+            Files.createLink(target, source);
+        } catch (final UnsupportedOperationException | IOException ex) {
+            Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static void deleteRecursively(final Path dir) throws IOException {
+        if (!Files.exists(dir)) {
+            return;
+        }
+        try (Stream<Path> paths = Files.walk(dir)) {
+            paths.sorted(Comparator.reverseOrder()).forEach(path -> {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (final IOException ex) {
+                    throw new UncheckedIOException(ex);
+                }
+            });
         }
     }
 }
