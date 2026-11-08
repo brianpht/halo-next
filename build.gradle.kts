@@ -18,10 +18,12 @@ repositories {
     mavenCentral()
 }
 
-// Agrona 2.x accesses jdk.internal.misc.Unsafe and sun.nio.ch on modern JDKs.
+// Agrona 2.x accesses jdk.internal.misc.Unsafe and sun.nio.ch on modern JDKs;
+// Crc32c reflects into java.util.zip.CRC32C for the hardware-accelerated path.
 val agronaJvmArgs = listOf(
     "--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
     "--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
+    "--add-opens", "java.base/java.util.zip=ALL-UNNAMED",
 )
 
 java {
