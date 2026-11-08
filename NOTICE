@@ -1,0 +1,15 @@
+halo-next
+Copyright 2026 halo-next authors
+
+This product is a port / re-implementation of HaloDB, combined with the Agrona
+framework.
+
+This product includes software developed as HaloDB.
+Copyright 2018, Oath Inc.
+Licensed under the Apache License, Version 2.0.
+https://github.com/yahoo/HaloDB
+
+This product includes and depends on Agrona.
+Copyright 2014-2024 Real Logic Limited.
+Licensed under the Apache License, Version 2.0.
+https://github.com/aeron-io/agrona

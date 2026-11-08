@@ -1,0 +1,25 @@
+[versions]
+agrona = "2.6.1"
+hdrhistogram = "2.2.2"
+junit = "5.11.4"
+jqwik = "1.9.2"
+jmh = "1.37"
+checkstyle = "10.20.1"
+
+# plugin versions
+spotless = "6.25.0"
+jmhPlugin = "0.7.2"
+
+[libraries]
+agrona = { group = "org.agrona", name = "agrona", version.ref = "agrona" }
+hdrhistogram = { group = "org.hdrhistogram", name = "HdrHistogram", version.ref = "hdrhistogram" }
+
+junit-jupiter = { group = "org.junit.jupiter", name = "junit-jupiter", version.ref = "junit" }
+junit-platform-launcher = { group = "org.junit.platform", name = "junit-platform-launcher", version = "1.11.4" }
+jqwik = { group = "net.jqwik", name = "jqwik", version.ref = "jqwik" }
+jmh-core = { group = "org.openjdk.jmh", name = "jmh-core", version.ref = "jmh" }
+jmh-annprocess = { group = "org.openjdk.jmh", name = "jmh-generator-annprocess", version.ref = "jmh" }
+
+[plugins]
+spotless = { id = "com.diffplug.spotless", version.ref = "spotless" }
+jmh = { id = "me.champeau.jmh", version.ref = "jmhPlugin" }
