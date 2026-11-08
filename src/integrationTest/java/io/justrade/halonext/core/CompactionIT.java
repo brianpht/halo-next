@@ -7,6 +7,7 @@ package io.justrade.halonext.core;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -112,6 +113,59 @@ class CompactionIT {
             assertEquals(n, engine.size());
             for (int i = 0; i < n; i++) {
                 assertArrayEquals(value(i, rounds), engine.get(key(i)), "reopened key " + i);
+            }
+        }
+    }
+
+    @Test
+    void snapshotDuringRateLimitedCompactionStaysConsistent(@TempDir final Path dir) throws Exception {
+        final int n = 300;
+        final int rounds = 8;
+        // A low job rate forces the rate limiter to sleep, so compaction is in flight (and
+        // mid-throttle) when snapshots are taken - exactly the window the old pause race lost.
+        final HaloDBOptions opts = options(true).setCompactionJobRate(8 * 1024);
+        try (HaloEngine engine = HaloEngine.open(dir, opts)) {
+            for (int round = 0; round <= rounds; round++) {
+                for (int i = 0; i < n; i++) {
+                    engine.put(key(i), value(i, round));
+                }
+            }
+
+            // Overwrites leave many fully stale files queued for rate-limited compaction.
+            assertFalse(engine.isCompactionComplete(), "expected pending compaction right after writes");
+
+            int snapshotsWhileCompacting = 0;
+            final long deadline = System.nanoTime() + 30_000_000_000L;
+            while (!engine.isCompactionComplete() && System.nanoTime() < deadline) {
+                assertTrue(engine.snapshot(), "snapshot during active compaction");
+                assertSnapshotConsistent(engine.getSnapshotDirectory(), n, rounds);
+                snapshotsWhileCompacting++;
+            }
+            assertTrue(snapshotsWhileCompacting > 0, "no snapshot ran while compaction was active");
+
+            // And once compaction has drained, a final snapshot is still consistent.
+            assertTrue(engine.snapshot());
+            assertSnapshotConsistent(engine.getSnapshotDirectory(), n, rounds);
+
+            assertEquals(n, engine.size());
+            for (int i = 0; i < n; i++) {
+                assertArrayEquals(value(i, rounds), engine.get(key(i)), "live key " + i);
+            }
+        }
+    }
+
+    /** Reopens the hard-linked snapshot as a fresh engine and asserts every live key resolves. */
+    private static void assertSnapshotConsistent(final Path snapshotDir, final int n, final int rounds)
+            throws IOException {
+        final HaloDBOptions readOptions = new HaloDBOptions()
+                .setMaxFileSize(512)
+                .setMaxTombstoneFileSize(256)
+                .setNumberOfRecords(1024)
+                .setCompactionEnabled(false);
+        try (HaloEngine snapshot = HaloEngine.open(snapshotDir, readOptions)) {
+            assertEquals(n, snapshot.size(), "snapshot live count");
+            for (int i = 0; i < n; i++) {
+                assertArrayEquals(value(i, rounds), snapshot.get(key(i)), "snapshot key " + i);
             }
         }
     }

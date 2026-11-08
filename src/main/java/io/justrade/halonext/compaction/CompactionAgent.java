@@ -24,12 +24,16 @@ public final class CompactionAgent implements Agent {
 
     @Override
     public int doWork() throws Exception {
-        final int fileId = target.pollFileId();
+        final int fileId = target.beginCompaction();
         if (fileId < 0) {
             return 0;
         }
-        rateLimiter.acquire(target.fileSizeBytes(fileId));
-        target.compact(fileId);
+        try {
+            rateLimiter.acquire(target.fileSizeBytes(fileId), target::isPausePending);
+            target.compact(fileId);
+        } finally {
+            target.endCompaction();
+        }
         return 1;
     }
 

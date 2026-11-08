@@ -27,6 +27,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Comparator;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 import org.agrona.CloseHelper;
@@ -81,8 +82,14 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
     private final AtomicCounter deleteCounter = new AtomicCounter(countersBuffer, 2);
 
     private volatile DataFile[] readFiles;
-    private volatile boolean compacting;
-    private volatile boolean compactionPaused;
+
+    // Compaction pause handshake (single-writer: only the agent flips compactionActive).
+    // pauseLock serializes "start a work unit" against "request a pause", so a pause that
+    // arrives after a file is polled but before compaction finishes always waits for it.
+    private final ReentrantLock pauseLock = new ReentrantLock();
+    private final Condition compactionIdle = pauseLock.newCondition();
+    private volatile boolean pauseRequested;
+    private volatile boolean compactionActive;
     private int polledFileId = -1;
     private long totalStaleBytes;
 
@@ -187,19 +194,34 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
     }
 
     public boolean isCompactionComplete() {
-        return compactionQueue.size() == 0 && !compacting;
+        return compactionQueue.size() == 0 && !compactionActive;
     }
 
-    /** Stops the agent from starting new compactions and waits for any in-flight compaction to finish. */
+    /**
+     * Stops the agent from starting new compactions and waits for any in-flight compaction
+     * to finish. Once this returns, {@code pauseRequested} stays set so no new work unit can
+     * start, and {@code compactionActive} is false, so callers (for example snapshot) observe
+     * a quiescent compaction state until {@link #resumeCompaction()}.
+     */
     public void pauseCompaction() {
-        compactionPaused = true;
-        while (compacting) {
-            Thread.onSpinWait();
+        pauseLock.lock();
+        try {
+            pauseRequested = true;
+            while (compactionActive) {
+                compactionIdle.awaitUninterruptibly();
+            }
+        } finally {
+            pauseLock.unlock();
         }
     }
 
     public void resumeCompaction() {
-        compactionPaused = false;
+        pauseLock.lock();
+        try {
+            pauseRequested = false;
+        } finally {
+            pauseLock.unlock();
+        }
     }
 
     public long numberOfPuts() {
@@ -288,6 +310,12 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
                 if (currentTombstoneFile != null) {
                     currentTombstoneFile.flush();
                 }
+                if (compactionWriteFile != null) {
+                    compactionWriteFile.flush();
+                }
+                if (compactionIndexFile != null) {
+                    compactionIndexFile.flush();
+                }
             } finally {
                 writeLock.unlock();
             }
@@ -342,11 +370,40 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
     // --- CompactionTarget ---
 
     @Override
-    public int pollFileId() {
-        polledFileId = -1;
-        if (compactionPaused) {
-            return -1;
+    public int beginCompaction() {
+        pauseLock.lock();
+        try {
+            if (pauseRequested) {
+                return -1;
+            }
+            final int fileId = pollNextFileId();
+            if (fileId >= 0) {
+                compactionActive = true;
+            }
+            return fileId;
+        } finally {
+            pauseLock.unlock();
         }
+    }
+
+    @Override
+    public void endCompaction() {
+        pauseLock.lock();
+        try {
+            compactionActive = false;
+            compactionIdle.signalAll();
+        } finally {
+            pauseLock.unlock();
+        }
+    }
+
+    @Override
+    public boolean isPausePending() {
+        return pauseRequested;
+    }
+
+    private int pollNextFileId() {
+        polledFileId = -1;
         compactionQueue.read(pollHandler, 1);
         if (polledFileId >= 0) {
             writeLock.lock();
@@ -377,27 +434,22 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
         if (source == null) {
             return;
         }
-        compacting = true;
-        try {
-            final RecordLocation location = new RecordLocation();
-            final DataFile.RecordIterator it = source.iterator();
-            while (it.next()) {
-                final int keySize = it.keySize();
-                final byte[] key = new byte[keySize];
-                it.copyKey(key);
-                final long sequenceNumber = it.sequenceNumber();
-                if (index.get(key, location)
-                        && location.fileId() == fileId
-                        && location.sequenceNumber() == sequenceNumber) {
-                    final byte[] value = new byte[it.valueSize()];
-                    it.copyValue(value);
-                    migrateRecord(key, value, sequenceNumber);
-                }
+        final RecordLocation location = new RecordLocation();
+        final DataFile.RecordIterator it = source.iterator();
+        while (it.next()) {
+            final int keySize = it.keySize();
+            final byte[] key = new byte[keySize];
+            it.copyKey(key);
+            final long sequenceNumber = it.sequenceNumber();
+            if (index.get(key, location)
+                    && location.fileId() == fileId
+                    && location.sequenceNumber() == sequenceNumber) {
+                final byte[] value = new byte[it.valueSize()];
+                it.copyValue(value);
+                migrateRecord(key, value, sequenceNumber);
             }
-            retireFile(fileId, source);
-        } finally {
-            compacting = false;
         }
+        retireFile(fileId, source);
     }
 
     // --- recovery and file management ---

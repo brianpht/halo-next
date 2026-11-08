@@ -91,6 +91,31 @@ live records migrate to a separate compaction write file and the index is
 updated with a sequence-number guard. Write amplification is approximately
 `1 / compactionThresholdPerFile`.
 
+## Snapshot and pause
+
+`snapshot()` captures a consistent on-disk image by hard-linking (or copying) the
+database files, so it must observe a quiescent compaction state. The engine uses
+a pause handshake owned by the single compaction thread (see ADR-0005):
+
+```mermaid
+sequenceDiagram
+    participant A as Compaction agent
+    participant S as snapshot caller
+    A->>A: beginCompaction() under pauseLock: poll + mark active (atomic)
+    A->>A: rateLimiter.acquire(size, abort=pausePending)
+    S->>S: pauseCompaction(): set pauseRequested, await !active
+    A->>A: compact(fileId), then endCompaction(): clear active + signal
+    S->>S: flush files, hard-link image, resumeCompaction()
+```
+
+A compaction work unit is bracketed by `beginCompaction()` and `endCompaction()`,
+so it spans the rate-limit wait as well as the rewrite. `beginCompaction()` both
+checks the pause flag and marks the unit active in one `pauseLock` section, so a
+pause can never slip between polling a file and starting its compaction. While
+`pauseRequested` stays set no new unit begins, and the rate-limit wait aborts
+early on a pending pause so the pause is not delayed by throttling. Lock order is
+always `pauseLock` then `writeLock`.
+
 ## Recovery
 
 On open the engine replays every index file (ascending) to rebuild the off-heap
@@ -107,3 +132,6 @@ file. The META open flag distinguishes a clean shutdown from a crash.
 - Compaction: one background agent thread; file-id allocation and the read-file
   array are guarded by a dedicated monitor; the index uses sequence-number
   guarded `replace`.
+- Pause/snapshot: a dedicated `pauseLock` plus a condition variable quiesce the
+  compaction agent for a consistent snapshot (ADR-0005); the hot path never
+  touches it.
