@@ -207,6 +207,11 @@ Goal: reclaim stale space without hurting foreground latency.
 Deliverables: compaction correctness tests (no lost / resurrected keys); write-
 amplification assertion `~1/threshold`; soak test with allocation profiler.
 
+Note: the compaction path allocates a key/value array per migrated record. This
+is the rate-limited background path, not the foreground hot path. An allocation-
+free compaction (off-heap key lookup so migration copies buffer-to-buffer) is a
+documented follow-up tracked under M2 hardening.
+
 ### Sprint 6 - Public API, iterators, stats, snapshot (M3)
 
 Goal: feature parity surface.

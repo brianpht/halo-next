@@ -151,6 +151,11 @@ public final class DataFile implements AutoCloseable {
         }
     }
 
+    /** Opens a forward iterator over all valid records; stops at the first corrupt or torn record. */
+    public RecordIterator iterator() throws IOException {
+        return new RecordIterator(FileChannels.readAll(channel));
+    }
+
     private void flushIfNeeded() throws IOException {
         if (syncWrite || (flushDataSizeBytes >= 0 && unflushedBytes > flushDataSizeBytes)) {
             flush();
@@ -173,5 +178,58 @@ public final class DataFile implements AutoCloseable {
             pos += read;
         }
         buffer.flip();
+    }
+
+    /** Forward cursor over records. Reuses one flyweight; allocation-free per step. */
+    public static final class RecordIterator {
+
+        private final UnsafeBuffer buffer;
+        private final int limit;
+        private final RecordFlyweight record = new RecordFlyweight();
+        private int position;
+        private int recordStart;
+
+        RecordIterator(final UnsafeBuffer buffer) {
+            this.buffer = buffer;
+            this.limit = buffer.capacity();
+        }
+
+        public boolean next() {
+            if (position + RecordFlyweight.HEADER_LENGTH > limit) {
+                return false;
+            }
+            final RecordFlyweight fly = record.wrap(buffer, position);
+            final int recordLength = RecordFlyweight.HEADER_LENGTH + fly.keySize() + fly.valueSize();
+            if (position + recordLength > limit || !fly.verifyChecksum()) {
+                return false;
+            }
+            recordStart = position;
+            position += recordLength;
+            return true;
+        }
+
+        public int recordOffset() {
+            return recordStart;
+        }
+
+        public int keySize() {
+            return record.keySize();
+        }
+
+        public int valueSize() {
+            return record.valueSize();
+        }
+
+        public long sequenceNumber() {
+            return record.sequenceNumber();
+        }
+
+        public void copyKey(final byte[] dst) {
+            buffer.getBytes(record.keyOffset(), dst, 0, record.keySize());
+        }
+
+        public void copyValue(final byte[] dst) {
+            buffer.getBytes(record.valueOffset(), dst, 0, record.valueSize());
+        }
     }
 }
