@@ -158,6 +158,11 @@ Goal: port the segmented off-heap hash table onto Agrona primitives.
 Deliverables: put/get/delete/replace concurrency tests; load / rehash tests;
 JMH lookup benchmark (budget < 200 ns hit).
 
+Note: the non-pool segment strategy is implemented. The fixed-slot memory-pool
+strategy (`useMemoryPool` + `fixedKeySize`) is deferred to a follow-up task
+tracked under M2 hardening; it is a predictable-memory optimization and not
+required for functional correctness.
+
 ### Sprint 3 - File and directory layer (M1)
 
 Goal: append log, index, tombstone, and directory management.
