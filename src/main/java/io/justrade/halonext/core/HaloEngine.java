@@ -86,8 +86,13 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
     // Compaction pause handshake (single-writer: only the agent flips compactionActive).
     // pauseLock serializes "start a work unit" against "request a pause", so a pause that
     // arrives after a file is polled but before compaction finishes always waits for it.
+    // pauseCount reference-counts overlapping pause holders (for example a live iterator plus
+    // a concurrent snapshot); compaction only resumes when the last holder releases. See
+    // docs/decisions/0005-compaction-pause-handshake.md. pauseRequested mirrors pauseCount > 0
+    // so the rate-limit abort supplier can read it lock-free.
     private final ReentrantLock pauseLock = new ReentrantLock();
     private final Condition compactionIdle = pauseLock.newCondition();
+    private int pauseCount;
     private volatile boolean pauseRequested;
     private volatile boolean compactionActive;
     private int polledFileId = -1;
@@ -199,13 +204,17 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
 
     /**
      * Stops the agent from starting new compactions and waits for any in-flight compaction
-     * to finish. Once this returns, {@code pauseRequested} stays set so no new work unit can
-     * start, and {@code compactionActive} is false, so callers (for example snapshot) observe
-     * a quiescent compaction state until {@link #resumeCompaction()}.
+     * to finish. Pauses are reference-counted: each call must be balanced by a matching
+     * {@link #resumeCompaction()}, and compaction stays quiescent until the last holder
+     * resumes. This lets overlapping holders (for example a live iterator and a concurrent
+     * snapshot) nest safely without one holder's resume releasing the other's pause. Once
+     * this returns, {@code pauseRequested} stays set so no new work unit can start, and
+     * {@code compactionActive} is false, so callers observe a quiescent compaction state.
      */
     public void pauseCompaction() {
         pauseLock.lock();
         try {
+            pauseCount++;
             pauseRequested = true;
             while (compactionActive) {
                 compactionIdle.awaitUninterruptibly();
@@ -215,10 +224,18 @@ public final class HaloEngine implements AutoCloseable, CompactionTarget {
         }
     }
 
+    /**
+     * Releases one pause holder. Compaction resumes only when the count reaches zero, so a
+     * resume by one holder never clears a pause still held by another. Extra resumes beyond
+     * the outstanding holder count are ignored, keeping compaction paused rather than resuming
+     * early (correctness over throughput).
+     */
     public void resumeCompaction() {
         pauseLock.lock();
         try {
-            pauseRequested = false;
+            if (pauseCount > 0 && --pauseCount == 0) {
+                pauseRequested = false;
+            }
         } finally {
             pauseLock.unlock();
         }

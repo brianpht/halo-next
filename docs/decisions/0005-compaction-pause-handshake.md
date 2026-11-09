@@ -86,6 +86,30 @@ Negative / neutral:
   deferred to option D (below); this ADR does not regress any performance-budget
   metric and does not change the on-disk format.
 
+## Amendment: reference-counted pause holders
+
+The handshake as first shipped kept `pauseRequested` as a single binary flag. That
+is correct for one holder but wrong when two pause holders overlap. A `HaloDBIterator`
+holds a pause for its whole lifetime (its `RecordScanner` constructor calls
+`pauseCompaction()`); if a `snapshot()` runs concurrently it calls
+`pauseCompaction()`/`resumeCompaction()` around its link step. With a binary flag the
+snapshot's `resumeCompaction()` clears the shared flag, so compaction resumes while
+the iterator is still scanning. A file can then be retired under the cursor, and the
+scan reads a closed channel (`ClosedChannelException` surfaced as
+`UncheckedIOException`) or silently skips records. This is a correctness failure by
+the project priority order.
+
+Fix: `pauseRequested` becomes a reference count (`pauseCount`) guarded by `pauseLock`.
+Each `pauseCompaction()` increments it and each `resumeCompaction()` decrements it;
+compaction resumes only when the count returns to zero. A `volatile boolean
+pauseRequested` mirrors `pauseCount > 0` so the rate-limit abort supplier
+(`isPausePending()`) can still read it lock-free. An unbalanced extra `resume` is
+clamped at zero rather than underflowing, so the failure mode is "stay paused" rather
+than "resume early" - the safe direction. Overlapping holders now nest correctly; no
+on-disk format or hot-path impact. This is the minimal correctness fix and remains
+subsumed by option D, after which `snapshot()` would hold a pinned version instead of
+pausing at all.
+
 ## Alternatives Considered
 
 ### Option D - Version pinning / reference counting (no pause at all)

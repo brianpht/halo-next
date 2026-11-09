@@ -171,6 +171,64 @@ class CompactionIT {
     }
 
     @Test
+    void nestedPauseHoldersRequireMatchingResumes(@TempDir final Path dir) throws Exception {
+        try (HaloEngine engine = HaloEngine.open(dir, options(false))) {
+            engine.pauseCompaction();
+            engine.pauseCompaction();
+            assertTrue(engine.isPausePending(), "two holders: pause pending");
+
+            engine.resumeCompaction();
+            assertTrue(engine.isPausePending(), "one holder left: pause must stay pending");
+
+            engine.resumeCompaction();
+            assertFalse(engine.isPausePending(), "last holder resumed: pause cleared");
+
+            // An unbalanced extra resume must not underflow the count or resume early.
+            engine.resumeCompaction();
+            assertFalse(engine.isPausePending());
+            engine.pauseCompaction();
+            assertTrue(engine.isPausePending(), "a fresh pause still takes effect after an extra resume");
+            engine.resumeCompaction();
+            assertFalse(engine.isPausePending());
+        }
+    }
+
+    @Test
+    void snapshotDoesNotResumeAPauseHeldByAnotherHolder(@TempDir final Path dir) throws Exception {
+        final int n = 120;
+        final int rounds = 4;
+        try (HaloEngine engine = HaloEngine.open(dir, options(false))) {
+            for (int round = 0; round <= rounds; round++) {
+                for (int i = 0; i < n; i++) {
+                    engine.put(key(i), value(i, round));
+                }
+            }
+            // Overwrites leave fully stale files queued, so beginCompaction would poll one
+            // unless a pause blocks it - this makes the -1 assertion below meaningful.
+            assertFalse(engine.isCompactionComplete(), "expected queued files for compaction");
+
+            // Holder A (modelling a live iterator) pauses compaction for its whole lifetime.
+            engine.pauseCompaction();
+            assertTrue(engine.isPausePending());
+
+            // Holder B (snapshot) nests its own pause/resume inside A's pause window.
+            assertTrue(engine.snapshot());
+
+            // With the old binary flag, B's resume cleared A's pause here, letting compaction
+            // retire a file under A. With refcounting, A's pause survives.
+            assertTrue(engine.isPausePending(), "iterator pause must survive the snapshot resume");
+            assertEquals(-1, engine.beginCompaction(), "no new compaction unit may start under holder A");
+
+            // Holder A releases: compaction resumes and the queued work is now pollable.
+            engine.resumeCompaction();
+            assertFalse(engine.isPausePending(), "pause released after the last holder resumes");
+            final int fileId = engine.beginCompaction();
+            assertTrue(fileId >= 0, "queue had work; the earlier -1 was the pause, not an empty queue");
+            engine.endCompaction();
+        }
+    }
+
+    @Test
     void compactionAfterDeletesDropsData(@TempDir final Path dir) throws Exception {
         final int n = 300;
         try (HaloEngine engine = HaloEngine.open(dir, options(false))) {
