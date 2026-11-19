@@ -131,7 +131,9 @@ Rejected for now as too large for the immediate correctness fix. Option C is the
 correct, minimal, single-writer-aligned fix and is independently useful as the admin
 "pause all background work" primitive (as in RocksDB `PauseBackgroundWork`). Option D
 remains the recommended long-term direction and can supersede this ADR; when adopted,
-`snapshot()` would no longer call `pauseCompaction()`.
+`snapshot()` would no longer call `pauseCompaction()`. Option D is now drafted as
+ADR-0006 (Proposed); on acceptance it supersedes this ADR for the snapshot/iterator
+consistency path, and the pause primitive here is demoted to admin-only.
 
 ### Local two-flag fixes (set the busy flag earlier, or re-check under a lock)
 
