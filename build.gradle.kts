@@ -134,9 +134,17 @@ tasks.register("jmhBudgetCheck") {
     doLast {
         val budgetsNs = mapOf(
             "decodeHeader" to 100.0,
+            "encodeRecord" to 100.0,
+            "encodeIndexEntry" to 100.0,
+            "encodeTombstone" to 100.0,
             "lookupHit" to 200.0,
+            "lookupMiss" to 200.0,
+            "indexInsert" to 300.0,
+            "indexReplace" to 300.0,
             "get" to 10_000.0,
+            "getMiss" to 1_000.0,
             "put" to 5_000.0,
+            "delete" to 5_000.0,
         )
         val file = resultsFile.get().asFile
         if (!file.exists()) {

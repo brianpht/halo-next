@@ -43,6 +43,7 @@ public class EngineBenchmark {
     private Path dir;
     private HaloEngine engine;
     private byte[][] keys;
+    private byte[][] missKeys;
     private byte[] value;
     private int cursor;
 
@@ -52,9 +53,11 @@ public class EngineBenchmark {
         engine = HaloEngine.open(
                 dir, new HaloDBOptions().setNumberOfRecords(KEY_COUNT).setCompactionEnabled(false));
         keys = new byte[KEY_COUNT][];
+        missKeys = new byte[KEY_COUNT][];
         value = new byte[100];
         for (int i = 0; i < KEY_COUNT; i++) {
             keys[i] = ("key-" + i).getBytes(StandardCharsets.UTF_8);
+            missKeys[i] = ("absent-" + i).getBytes(StandardCharsets.UTF_8);
             engine.put(keys[i], value);
         }
     }
@@ -78,6 +81,13 @@ public class EngineBenchmark {
         final int i = cursor;
         cursor = i + 1 == KEY_COUNT ? 0 : i + 1;
         return engine.get(keys[i]);
+    }
+
+    @Benchmark
+    public byte[] getMiss() throws IOException {
+        final int i = cursor;
+        cursor = i + 1 == KEY_COUNT ? 0 : i + 1;
+        return engine.get(missKeys[i]);
     }
 
     @Benchmark

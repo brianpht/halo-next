@@ -21,8 +21,9 @@ import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Warmup;
 
 /**
- * Micro-benchmark for an off-heap index lookup hit. Budget: index lookup
- * (off-heap, hit) &lt; 200 ns.
+ * Micro-benchmark for off-heap index operations. Budgets: index lookup
+ * (off-heap, hit) &lt; 200 ns; lookup miss &lt; 200 ns; overwrite insert and
+ * compaction replace &lt; 300 ns.
  */
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
@@ -36,6 +37,7 @@ public class IndexLookupBenchmark {
 
     private OffHeapIndex index;
     private byte[][] keys;
+    private byte[][] missKeys;
     private RecordLocation loc;
     private int cursor;
 
@@ -43,8 +45,10 @@ public class IndexLookupBenchmark {
     public void setup() {
         index = new OffHeapIndex(KEY_COUNT);
         keys = new byte[KEY_COUNT][];
+        missKeys = new byte[KEY_COUNT][];
         for (int i = 0; i < KEY_COUNT; i++) {
             keys[i] = ("key-" + i).getBytes(StandardCharsets.UTF_8);
+            missKeys[i] = ("absent-" + i).getBytes(StandardCharsets.UTF_8);
             index.put(keys[i], i % 16, i * 32, 32, i + 1L);
         }
         loc = new RecordLocation();
@@ -60,5 +64,28 @@ public class IndexLookupBenchmark {
         final int i = cursor;
         cursor = i + 1 == KEY_COUNT ? 0 : i + 1;
         return index.get(keys[i], loc);
+    }
+
+    @Benchmark
+    public boolean lookupMiss() {
+        final int i = cursor;
+        cursor = i + 1 == KEY_COUNT ? 0 : i + 1;
+        return index.get(missKeys[i], loc);
+    }
+
+    @Benchmark
+    public boolean indexInsert() {
+        final int i = cursor;
+        cursor = i + 1 == KEY_COUNT ? 0 : i + 1;
+        // Overwrites an existing slot in place (allocation-free); exercises the put path.
+        return index.put(keys[i], i % 16, i * 32, 32, i + 1L);
+    }
+
+    @Benchmark
+    public boolean indexReplace() {
+        final int i = cursor;
+        cursor = i + 1 == KEY_COUNT ? 0 : i + 1;
+        // newSequenceNumber equals the expected value, so the replace is repeatable.
+        return index.replace(keys[i], i + 1L, i % 16, i * 32, 32, i + 1L);
     }
 }
