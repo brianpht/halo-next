@@ -171,9 +171,11 @@ markdown summary table for Tier 2, written under `build/results/benchmark/`.
 - CI step 5 unchanged: `./gradlew jmh -PquickBench` + `jmhBudgetCheck` smoke,
   fail on > 10% regression vs ADR-0003 baseline.
 - Tier 2 macro harness: a runnable entry point driven by a gradle task
-  (`benchmarkRun -Pworkload=smoke -Pbench=READ_RANDOM`). Not part of the
+  (`benchmarkRun -Pworkload=READ_RANDOM -Ptier=smoke`). Not part of the
   per-commit gate; run on demand and on the benchmark host. The `smoke` tier of
   `FILL_SEQUENCE` + `READ_RANDOM` can be added as a nightly job.
+- File-layer JMH benchmarks (`append`, `readValue`) and all Tier 2 numbers are
+  I/O bound and NOT gated; on WSL they are indicative only.
 - Any regression > 10% on any percentile requires rollback or a new ADR, per
   the performance budget.
 
@@ -190,20 +192,40 @@ markdown summary table for Tier 2, written under `build/results/benchmark/`.
 
 2. Phase 2 - File-layer benchmarks
    - Add `file` `append` and `readValue` benchmarks (warm and cold variants).
+   - Status: DONE. `FileBenchmark` (jmh, `file/`) measures buffered sequential
+     `append` and warm random `readValue`. These are I/O bound and deliberately
+     NOT wired into `jmhBudgetCheck` - the filesystem (especially WSL / overlay
+     dev boxes) makes them too noisy to gate on.
 
 3. Phase 3 - Macro harness skeleton
    - Preseeded data generator, HdrHistogram reporter, rate limiter, options
      presets, dataset tiers, JSON + markdown output.
    - Implement `FILL_SEQUENCE` and `FILL_RANDOM`.
+   - Status: DONE. Dedicated `benchmark` source set under `src/benchmark/java`:
+     `DataGenerator`, `LatencyStats` (HdrHistogram), `DatasetTier`
+     (smoke/small/medium/release), `Workload`, `BenchmarkReport` (JSON + md),
+     `MacroBenchmark`, `BenchmarkRunner`. Reuses the engine `RateLimiter` (no
+     Guava). Run via `./gradlew benchmarkRun -Pworkload=... -Ptier=...`.
 
 4. Phase 4 - Read and mixed workloads
    - Implement `READ_RANDOM` (32 threads), `RANDOM_UPDATE`, `READ_AND_UPDATE`.
    - Add read-amplification and write-amplification instrumentation.
+   - Status: DONE. Read/update/mixed workloads pre-populate the dataset so reads
+     hit; per-thread HdrHistogram aggregated into tail percentiles; write
+     amplification = on-disk bytes / logical bytes; read amplification reported
+     as the structural constant 1.
 
 5. Phase 5 - Compaction and soak
    - `compactFile` throughput benchmark.
    - Long-running soak at `small`/`medium` tier with allocation profiler
      attached, asserting zero steady-state GC during the operational window.
+   - Status: DONE (as macro workloads, not JMH). `COMPACTION` fills, accumulates
+     stale data with compaction paused (using a smaller file size so files roll),
+     then times a full reclaim pass and reports reclaim MB/s. `SOAK` runs a
+     time-bounded mixed read/write loop; attach `-prof`/async-profiler
+     externally to verify zero steady-state GC. A dedicated JMH `compactFile`
+     micro-benchmark is intentionally deferred: compaction is destructive and
+     one-shot per file (poor JMH fit) and especially noisy on WSL.
 
 6. Phase 6 - Baseline capture and ADR
    - Run `medium` tier on the benchmark host, record numbers, update ADR-0003
@@ -211,12 +233,15 @@ markdown summary table for Tier 2, written under `build/results/benchmark/`.
 
 ## 8. Open Questions
 
-- Rate limiter: Agrona-native token bucket vs a minimal custom limiter (avoid
-  Guava, which was the HaloDB dependency being removed).
-- Macro harness location: extend the `jmh` source set vs a dedicated
-  `benchmark` source set / runnable main. Leaning toward a dedicated source set
-  so the driver can allocate freely without polluting hot-path lint rules.
+- Environment: the current dev box is WSL, where I/O throughput, tail latency,
+  and GC timing are not representative. Treat all file-layer and macro numbers
+  produced here as indicative only; capture authoritative baselines on a
+  dedicated Linux host (Phase 6).
+- Rate limiter: RESOLVED. The macro harness reuses the engine `RateLimiter`
+  (token bucket, no Guava).
+- Macro harness location: RESOLVED. A dedicated `benchmark` source set, excluded
+  from the hot-path `-Werror` / checkstyle gates so the driver can allocate
+  freely.
 - Whether to vendor a RocksDB comparison (HaloDB benchmarked against RocksDB and
   KyotoCabinet). Proposed: out of scope for v1, revisit after internal baselines
   are stable.
-```

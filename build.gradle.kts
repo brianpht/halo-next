@@ -43,6 +43,16 @@ val integrationTestImplementation: Configuration by configurations.getting {
 }
 configurations["integrationTestRuntimeOnly"].extendsFrom(configurations.testRuntimeOnly.get())
 
+// Dedicated source set for the macro benchmark harness. It is a cold-path driver
+// that may allocate freely, so it is excluded from the -Werror and checkstyle
+// hot-path gates (same treatment as the jmh source set).
+val benchmark: SourceSet by sourceSets.creating {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+configurations["benchmarkImplementation"].extendsFrom(configurations.implementation.get())
+configurations["benchmarkRuntimeOnly"].extendsFrom(configurations.runtimeOnly.get())
+
 dependencies {
     api(libs.agrona)
     implementation(libs.hdrhistogram)
@@ -116,10 +126,12 @@ jmh {
     }
 }
 
-tasks.withType<JavaCompile>().matching { it.name.contains("Jmh") }.configureEach {
+tasks.withType<JavaCompile>().matching { it.name.contains("Jmh") || it.name.contains("Benchmark") }.configureEach {
     options.compilerArgs.remove("-Werror")
 }
-tasks.withType<Checkstyle>().matching { it.name.contains("Jmh") || it.name.contains("jmh") }.configureEach {
+tasks.withType<Checkstyle>().matching {
+    it.name.contains("Jmh") || it.name.contains("jmh") || it.name.contains("Benchmark")
+}.configureEach {
     enabled = false
 }
 
@@ -173,6 +185,23 @@ tasks.register("jmhBudgetCheck") {
             throw GradleException("Hot-path latency budget exceeded (ADR 0003):\n  " + breaches.joinToString("\n  "))
         }
         logger.lifecycle("JMH budget check passed.")
+    }
+}
+
+// Runs a macro benchmark workload from the dedicated benchmark source set.
+// Example: ./gradlew benchmarkRun -Pworkload=READ_RANDOM -Ptier=smoke
+// Not part of the per-commit gate; numbers are environment-sensitive (see ADR 0003).
+tasks.register<JavaExec>("benchmarkRun") {
+    description = "Runs a macro benchmark workload (-Pworkload, -Ptier, -Pdir, -Pthreads, -Preads, -PwriteRate, -Pduration)."
+    group = "verification"
+    dependsOn("benchmarkClasses")
+    classpath = benchmark.runtimeClasspath
+    mainClass.set("io.justrade.halonext.benchmark.BenchmarkRunner")
+    jvmArgs(agronaJvmArgs)
+    listOf("workload", "tier", "dir", "threads", "reads", "writeRate", "duration").forEach { p ->
+        if (project.hasProperty(p)) {
+            systemProperty("halo.bench.$p", project.property(p) as String)
+        }
     }
 }
 

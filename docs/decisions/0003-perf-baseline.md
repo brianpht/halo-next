@@ -73,3 +73,8 @@ or justified with a new ADR.
 - CI step 5 runs `jmhBudgetCheck -PquickBench`; breaches fail the build.
 - The baseline table is indicative; publish a full-run number in the PR when a
   hot-path change lands.
+- File-layer benchmarks (`FileBenchmark.append`, `FileBenchmark.readValue`) and
+  the Tier 2 macro harness (`benchmarkRun`) are I/O bound and are NOT gated by
+  `jmhBudgetCheck`. On a WSL / overlay / shared dev box their numbers are not
+  representative; capture authoritative file-layer and macro baselines on a
+  dedicated Linux host.
